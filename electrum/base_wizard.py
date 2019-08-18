@@ -132,6 +132,7 @@ class BaseWizard(Logger):
             ('2fa', _("Wallet with two-factor authentication")),
             ('multisig',  _("Multi-signature wallet")),
             ('imported',  _("Import Bitcoin addresses or private keys")),
+            ('solo',  _("Import Solo BTC keys")),
         ]
         choices = [pair for pair in wallet_kinds if pair[0] in wallet_types]
         self.choice_dialog(title=title, message=message, choices=choices, run_next=self.on_wallet_type)
@@ -167,6 +168,16 @@ class BaseWizard(Logger):
             action = self.plugin.get_action(self.data)
         elif choice == 'imported':
             action = 'import_addresses_or_keys'
+        elif choice == 'solo':
+            action = 'choose_solo'
+        self.run(action)
+
+    def on_solo_type(self, choice):
+        self.solo_type = choice
+        if choice == 'solo':
+            action = 'import_solo'
+        elif choice == 'solo_pro':
+            action = 'import_solo_pro'
         self.run(action)
 
     def choose_multisig(self):
@@ -207,6 +218,36 @@ class BaseWizard(Logger):
         message = _("Enter a list of Bitcoin addresses (this will create a watching-only wallet), or a list of private keys.")
         self.add_xpub_dialog(title=title, message=message, run_next=self.on_import,
                              is_valid=v, allow_multi=True, show_wif_help=True)
+
+    def choose_solo(self):
+        title = _("Choose your Solo type")
+        message = _('Please Choose your Solo type')
+        choices = [
+                ('solo', _('Solo')),
+                ('solo_pro', _('Solo Pro')),
+            ]
+        self.choice_dialog(title=title, message=message, choices=choices, run_next=self.on_solo_type)
+
+    def import_solo(self):
+        self.add_solo_secret_dialog(run_next=self.on_import_solo,  is_solo_pro=False)
+        
+    def import_solo_pro(self):
+        self.add_solo_secret_dialog(run_next=self.on_import_solo,  is_solo_pro=True)
+
+    def on_import_solo(self, key):
+
+        self.data['addresses'] = {}
+        k = keystore.Imported_KeyStore({})
+        keys = keystore.get_private_keys(key)
+        for pk in keys:
+            assert bitcoin.is_private_key(pk)
+            txin_type, pubkey = k.import_privkey(pk, None)
+            addr = bitcoin.pubkey_to_address(txin_type, pubkey)
+            self.data['addresses'][addr] = {'type':txin_type, 'pubkey':pubkey, 'redeem_script':None}
+        self.keystores.append(k)
+
+
+        return self.run('create_wallet')
 
     def on_import(self, text):
         # text is already sanitized by is_address_list and is_private_keys_list
@@ -567,7 +608,7 @@ class BaseWizard(Logger):
         elif self.wallet_type == 'multisig':
             for i, k in enumerate(self.keystores):
                 self.data['x%d/'%(i+1)] = k.dump()
-        elif self.wallet_type == 'imported':
+        elif self.wallet_type == 'imported' or self.wallet_type == 'solo':
             if len(self.keystores) > 0:
                 keys = self.keystores[0].dump()
                 self.data['keystore'] = keys

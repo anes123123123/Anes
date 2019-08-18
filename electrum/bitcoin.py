@@ -309,6 +309,7 @@ def hash_encode(x: bytes) -> str:
 def hash_decode(x: str) -> bytes:
     return bfh(x)[::-1]
 
+is_base58=lambda string58: all(ord(c) in __b58chars for c in string58)
 
 ############ functions from pywallet #####################
 
