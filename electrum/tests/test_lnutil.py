@@ -1,5 +1,7 @@
+import os
 import unittest
 import json
+from typing import Dict, List
 
 from electrum import bitcoin
 from electrum.json_db import StoredDict
@@ -9,14 +11,18 @@ from electrum.lnutil import (RevocationStore, get_per_commitment_secret_from_see
                              derive_pubkey, make_htlc_tx, extract_ctn_from_tx, UnableToDeriveSecret,
                              get_compressed_pubkey_from_bech32, split_host_port, ConnStringFormatError,
                              ScriptHtlc, extract_nodeid, calc_fees_for_commitment_tx, UpdateAddHtlc, LnFeatures,
-                             ln_compare_features, IncompatibleLightningFeatures)
+                             ln_compare_features, IncompatibleLightningFeatures, offered_htlc_trim_threshold_sat,
+                             received_htlc_trim_threshold_sat)
 from electrum.util import bh2u, bfh, MyEncoder
-from electrum.transaction import Transaction, PartialTransaction
+from electrum.transaction import Transaction, PartialTransaction, Sighash
 from electrum.lnworker import LNWallet
 
 from . import ElectrumTestCase
+from .test_bitcoin import disable_ecdsa_r_value_grinding
 
 
+# test vectors for a single channel
+# https://github.com/lightningnetwork/lightning-rfc/blob/master/03-transactions.md#appendix-c-commitment-and-htlc-transaction-test-vectors
 funding_tx_id = '8984484a580b825b9972d7adb15050b3ab624ccd731946b3eeddb92f4e7ef6be'
 funding_output_index = 0
 funding_amount_satoshi = 10000000
@@ -37,6 +43,46 @@ local_delayedpubkey = bytes.fromhex('03fd5960528dc152014952efdb702a88f71e3c1653b
 local_revocation_pubkey = bytes.fromhex('0212a140cd0c6539d07cd08dfe09984dec3251ea808b892efeac3ede9402bf2b19')
 # funding wscript = 5221023da092f6980e58d2c037173180e9a465476026ee50f96695963e8efe436f54eb21030e9f7b623d2ccc7c9bd44d66d5ce21ce504c0acf6385a132cec6d3c39fa711c152ae
 
+
+# anchor test vectors are from https://github.com/lightningnetwork/lightning-rfc/commit/1739746afa3863ca783df9be4b7b0338afb63b49
+anchor_test_vector_path = os.path.join(os.path.dirname(__file__), "anchor-vectors.json")
+with open(anchor_test_vector_path) as f:
+    ANCHOR_TEST_VECTORS = json.load(f)
+
+# in a commitment transaction with all the below htlcs, the order is different,
+# indices 1 and 2 are swapped
+TEST_HTLCS = [
+    {
+        'incoming': True,
+        'amount':   1000000,
+        'expiry':   500,
+        'preimage': "0000000000000000000000000000000000000000000000000000000000000000",
+    },
+    {
+        'incoming': True,
+        'amount':   2000000,
+        'expiry':   501,
+        'preimage': "0101010101010101010101010101010101010101010101010101010101010101",
+    },
+    {
+        'incoming': False,
+        'amount':   2000000,
+        'expiry':   502,
+        'preimage': "0202020202020202020202020202020202020202020202020202020202020202",
+    },
+    {
+        'incoming': False,
+        'amount':   3000000,
+        'expiry':   503,
+        'preimage': "0303030303030303030303030303030303030303030303030303030303030303",
+    },
+    {
+        'incoming': True,
+        'amount':   4000000,
+        'expiry':   504,
+        'preimage': "0404040404040404040404040404040404040404040404040404040404040404",
+    }
+]
 
 class TestLNUtil(ElectrumTestCase):
     def test_shachain_store(self):
@@ -481,23 +527,23 @@ class TestLNUtil(ElectrumTestCase):
 
         htlc_cltv_timeout[2] = 502
         htlc_payment_preimage[2] = b"\x02" * 32
-        htlc[2] = make_offered_htlc(local_revocation_pubkey, remote_htlcpubkey, local_htlcpubkey, bitcoin.sha256(htlc_payment_preimage[2]))
+        htlc[2] = make_offered_htlc(local_revocation_pubkey, remote_htlcpubkey, local_htlcpubkey, bitcoin.sha256(htlc_payment_preimage[2]), has_anchors=False)
 
         htlc_cltv_timeout[3] = 503
         htlc_payment_preimage[3] = b"\x03" * 32
-        htlc[3] = make_offered_htlc(local_revocation_pubkey, remote_htlcpubkey, local_htlcpubkey, bitcoin.sha256(htlc_payment_preimage[3]))
+        htlc[3] = make_offered_htlc(local_revocation_pubkey, remote_htlcpubkey, local_htlcpubkey, bitcoin.sha256(htlc_payment_preimage[3]), has_anchors=False)
 
         htlc_cltv_timeout[0] = 500
         htlc_payment_preimage[0] = b"\x00" * 32
-        htlc[0] = make_received_htlc(local_revocation_pubkey, remote_htlcpubkey, local_htlcpubkey, bitcoin.sha256(htlc_payment_preimage[0]), htlc_cltv_timeout[0])
+        htlc[0] = make_received_htlc(local_revocation_pubkey, remote_htlcpubkey, local_htlcpubkey, bitcoin.sha256(htlc_payment_preimage[0]), htlc_cltv_timeout[0], has_anchors=False)
 
         htlc_cltv_timeout[1] = 501
         htlc_payment_preimage[1] = b"\x01" * 32
-        htlc[1] = make_received_htlc(local_revocation_pubkey, remote_htlcpubkey, local_htlcpubkey, bitcoin.sha256(htlc_payment_preimage[1]), htlc_cltv_timeout[1])
+        htlc[1] = make_received_htlc(local_revocation_pubkey, remote_htlcpubkey, local_htlcpubkey, bitcoin.sha256(htlc_payment_preimage[1]), htlc_cltv_timeout[1], has_anchors=False)
 
         htlc_cltv_timeout[4] = 504
         htlc_payment_preimage[4] = b"\x04" * 32
-        htlc[4] = make_received_htlc(local_revocation_pubkey, remote_htlcpubkey, local_htlcpubkey, bitcoin.sha256(htlc_payment_preimage[4]), htlc_cltv_timeout[4])
+        htlc[4] = make_received_htlc(local_revocation_pubkey, remote_htlcpubkey, local_htlcpubkey, bitcoin.sha256(htlc_payment_preimage[4]), htlc_cltv_timeout[4], has_anchors=False)
 
         remote_signature = "304402204fd4928835db1ccdfc40f5c78ce9bd65249b16348df81f0c44328dcdefc97d630220194d3869c38bc732dd87d13d2958015e2fc16829e74cd4377f84d215c0b70606"
         output_commit_tx = "02000000000101bef67e4e2fb9ddeeb3461973cd4c62abb35050b1add772995b820b584a488489000000000038b02b8007e80300000000000022002052bfef0479d7b293c27e0f1eb294bea154c63a3294ef092c19af51409bce0e2ad007000000000000220020403d394747cae42e98ff01734ad5c08f82ba123d3d9a620abda88989651e2ab5d007000000000000220020748eba944fedc8827f6b06bc44678f93c0f9e6078b35c6331ed31e75f8ce0c2db80b000000000000220020c20b5d1f8584fd90443e7b7b720136174fa4b9333c261d04dbbd012635c0f419a00f0000000000002200208c48d15160397c9731df9bc3b236656efb6665fbfe92b4a6878e88a499f741c4c0c62d0000000000160014ccf1af2f2aabee14bb40fa3851ab2301de843110e0a06a00000000002200204adb4e2f00643db396dd120d4e7dc17625f5f2c11a40d857accc862d6b7dd80e04004730440220275b0c325a5e9355650dc30c0eccfbc7efb23987c24b556b9dfdd40effca18d202206caceb2c067836c51f296740c7ae807ffcbfbf1dd3a0d56b6de9a5b247985f060147304402204fd4928835db1ccdfc40f5c78ce9bd65249b16348df81f0c44328dcdefc97d630220194d3869c38bc732dd87d13d2958015e2fc16829e74cd4377f84d215c0b7060601475221023da092f6980e58d2c037173180e9a465476026ee50f96695963e8efe436f54eb21030e9f7b623d2ccc7c9bd44d66d5ce21ce504c0acf6385a132cec6d3c39fa711c152ae3e195220"
@@ -527,8 +573,10 @@ class TestLNUtil(ElectrumTestCase):
             local_amount=to_local_msat,
             remote_amount=to_remote_msat,
             dust_limit_sat=local_dust_limit_satoshi,
-            fees_per_participant=calc_fees_for_commitment_tx(num_htlcs=len(htlcs), feerate=local_feerate_per_kw, is_local_initiator=True),
-            htlcs=htlcs)
+            fees_per_participant=calc_fees_for_commitment_tx(num_htlcs=len(htlcs), feerate=local_feerate_per_kw, is_local_initiator=True, has_anchors=False),
+            htlcs=htlcs,
+            has_anchors=False
+        )
         self.sign_and_insert_remote_sig(our_commit_tx, remote_funding_pubkey, remote_signature, local_funding_pubkey, local_funding_privkey)
         self.assertEqual(str(our_commit_tx), output_commit_tx)
 
@@ -555,22 +603,33 @@ class TestLNUtil(ElectrumTestCase):
         htlc_output_index = {0: 0, 1: 2, 2: 1, 3: 3, 4: 4}
 
         for i in range(5):
-            self.assertEqual(output_htlc_tx[i][1], self.htlc_tx(htlc[i], htlc_output_index[i],
+            self.assertEqual(output_htlc_tx[i][1], self.htlc_tx(
+                htlc[i],
+                htlc_output_index[i],
                 htlcs[i].htlc.amount_msat,
                 htlc_payment_preimage[i],
                 signature_for_output_remote_htlc[i],
-                output_htlc_tx[i][0], htlc_cltv_timeout[i] if not output_htlc_tx[i][0] else 0,
+                output_htlc_tx[i][0],
+                htlc_cltv_timeout[i] if not output_htlc_tx[i][0] else 0,
                 local_feerate_per_kw,
-                our_commit_tx))
+                our_commit_tx,
+                False,
+            ))
 
-    def htlc_tx(self, htlc, htlc_output_index, amount_msat, htlc_payment_preimage, remote_htlc_sig, success, cltv_timeout, local_feerate_per_kw, our_commit_tx):
+    def htlc_tx(self, htlc: bytes, htlc_output_index: int, amount_msat: int,
+                htlc_payment_preimage: bytes, remote_htlc_sig: str,
+                success: bool, cltv_timeout: int,
+                local_feerate_per_kw: int, our_commit_tx: PartialTransaction,
+                has_anchors: bool) -> str:
         _script, our_htlc_tx_output = make_htlc_tx_output(
             amount_msat=amount_msat,
             local_feerate=local_feerate_per_kw,
             revocationpubkey=local_revocation_pubkey,
             local_delayedpubkey=local_delayedpubkey,
             success=success,
-            to_self_delay=local_delay)
+            to_self_delay=local_delay,
+            has_anchors=has_anchors
+        )
         our_htlc_tx_inputs = make_htlc_tx_inputs(
             htlc_output_txid=our_commit_tx.txid(),
             htlc_output_index=htlc_output_index,
@@ -581,10 +640,16 @@ class TestLNUtil(ElectrumTestCase):
             inputs=our_htlc_tx_inputs,
             output=our_htlc_tx_output)
 
+        remote_sighash = Sighash.ALL
+        if has_anchors:
+            remote_sighash = Sighash.ANYONECANPAY | Sighash.SINGLE
+            our_htlc_tx.inputs()[0].nsequence = 1
+
+        our_htlc_tx.inputs()[0].sighash = Sighash.ALL
         local_sig = our_htlc_tx.sign_txin(0, local_privkey[:-1])
 
         our_htlc_tx_witness = make_htlc_tx_witness(
-            remotehtlcsig=bfh(remote_htlc_sig) + b"\x01",  # 0x01 is SIGHASH_ALL
+            remotehtlcsig=bfh(remote_htlc_sig) + remote_sighash.to_bytes(1, 'big'),
             localhtlcsig=bfh(local_sig),
             payment_preimage=htlc_payment_preimage if success else b'',  # will put 00 on witness if timeout
             witness_script=htlc)
@@ -614,8 +679,10 @@ class TestLNUtil(ElectrumTestCase):
             local_amount=to_local_msat,
             remote_amount=to_remote_msat,
             dust_limit_sat=local_dust_limit_satoshi,
-            fees_per_participant=calc_fees_for_commitment_tx(num_htlcs=0, feerate=local_feerate_per_kw, is_local_initiator=True),
-            htlcs=[])
+            fees_per_participant=calc_fees_for_commitment_tx(num_htlcs=0, feerate=local_feerate_per_kw, is_local_initiator=True, has_anchors=False),
+            htlcs=[],
+            has_anchors=False
+        )
         self.sign_and_insert_remote_sig(our_commit_tx, remote_funding_pubkey, remote_signature, local_funding_pubkey, local_funding_privkey)
 
         self.assertEqual(str(our_commit_tx), output_commit_tx)
@@ -643,8 +710,10 @@ class TestLNUtil(ElectrumTestCase):
             local_amount=to_local_msat,
             remote_amount=to_remote_msat,
             dust_limit_sat=local_dust_limit_satoshi,
-            fees_per_participant=calc_fees_for_commitment_tx(num_htlcs=0, feerate=local_feerate_per_kw, is_local_initiator=True),
-            htlcs=[])
+            fees_per_participant=calc_fees_for_commitment_tx(num_htlcs=0, feerate=local_feerate_per_kw, is_local_initiator=True, has_anchors=False),
+            htlcs=[],
+            has_anchors=False
+        )
         self.sign_and_insert_remote_sig(our_commit_tx, remote_funding_pubkey, remote_signature, local_funding_pubkey, local_funding_privkey)
 
         self.assertEqual(str(our_commit_tx), output_commit_tx)
@@ -710,11 +779,110 @@ class TestLNUtil(ElectrumTestCase):
             local_amount=to_local_msat,
             remote_amount=to_remote_msat,
             dust_limit_sat=local_dust_limit_satoshi,
-            fees_per_participant=calc_fees_for_commitment_tx(num_htlcs=0, feerate=local_feerate_per_kw, is_local_initiator=True),
-            htlcs=[])
+            fees_per_participant=calc_fees_for_commitment_tx(num_htlcs=0, feerate=local_feerate_per_kw, is_local_initiator=True, has_anchors=False),
+            htlcs=[],
+            has_anchors=False
+        )
         self.sign_and_insert_remote_sig(our_commit_tx, remote_funding_pubkey, remote_signature, local_funding_pubkey, local_funding_privkey)
         ref_commit_tx_str = '02000000000101bef67e4e2fb9ddeeb3461973cd4c62abb35050b1add772995b820b584a488489000000000038b02b8002c0c62d0000000000160014ccf1af2f2aabee14bb40fa3851ab2301de84311054a56a00000000002200204adb4e2f00643db396dd120d4e7dc17625f5f2c11a40d857accc862d6b7dd80e0400473044022051b75c73198c6deee1a875871c3961832909acd297c6b908d59e3319e5185a46022055c419379c5051a78d00dbbce11b5b664a0c22815fbcc6fcef6b1937c383693901483045022100f51d2e566a70ba740fc5d8c0f07b9b93d2ed741c3c0860c613173de7d39e7968022041376d520e9c0e1ad52248ddf4b22e12be8763007df977253ef45a4ca3bdb7c001475221023da092f6980e58d2c037173180e9a465476026ee50f96695963e8efe436f54eb21030e9f7b623d2ccc7c9bd44d66d5ce21ce504c0acf6385a132cec6d3c39fa711c152ae3e195220'
         self.assertEqual(str(our_commit_tx), ref_commit_tx_str)
+
+    @disable_ecdsa_r_value_grinding
+    def test_commitment_tx_anchors_test_vectors(self):
+        # this test is only valid for the original anchor output test vectors (not anchors-zero-fee-htlcs),
+        # therefore we patch the effective htlc tx weight to result in a finite weight
+        from electrum import lnutil
+        effective_htlc_tx_weight_original = lnutil.effective_htlc_tx_weight
+        def effective_htlc_tx_weight_patched(success: bool, has_anchors: bool):
+            return lnutil.HTLC_SUCCESS_WEIGHT_ANCHORS if success else lnutil.HTLC_TIMEOUT_WEIGHT_ANCHORS
+        lnutil.effective_htlc_tx_weight = effective_htlc_tx_weight_patched
+
+        try:
+            for test_vector in ANCHOR_TEST_VECTORS:
+                with self.subTest(test_vector['Name']):
+                    to_local_msat = test_vector['LocalBalance']
+                    to_remote_msat = test_vector['RemoteBalance']
+                    local_feerate_per_kw = test_vector['FeePerKw']
+                    ref_commit_tx_str = test_vector['ExpectedCommitmentTxHex']
+                    remote_signature = test_vector['RemoteSigHex']
+                    use_test_htlcs = test_vector['UseTestHtlcs']
+                    htlc_descs = test_vector['HtlcDescs']  # type: List[Dict[str, str]]
+
+                    remote_htlcpubkey = remotepubkey
+                    local_htlcpubkey = localpubkey
+
+                    # test of the commitment transaction, build htlc outputs first
+                    test_htlcs = {}
+                    if use_test_htlcs:
+                        # only consider htlcs whose sweep transaction creates outputs above dust limit
+                        threshold_sat_received = received_htlc_trim_threshold_sat(dust_limit_sat=local_dust_limit_satoshi, feerate=local_feerate_per_kw, has_anchors=True)
+                        threshold_sat_offered = offered_htlc_trim_threshold_sat(dust_limit_sat=local_dust_limit_satoshi, feerate=local_feerate_per_kw, has_anchors=True)
+                        for test_index, test_htlc in enumerate(TEST_HTLCS):
+                            if test_htlc['incoming']:
+                                htlc_script = make_received_htlc(
+                                    local_revocation_pubkey, remote_htlcpubkey, local_htlcpubkey,
+                                    bitcoin.sha256(bfh(test_htlc['preimage'])), test_htlc['expiry'],
+                                    has_anchors=True)
+                            else:
+                                htlc_script = make_offered_htlc(
+                                    local_revocation_pubkey, remote_htlcpubkey, local_htlcpubkey,
+                                    bitcoin.sha256(bfh(test_htlc['preimage'])), has_anchors=True)
+                            update_add_htlc = UpdateAddHtlc(
+                                amount_msat=test_htlc['amount'],
+                                payment_hash=bitcoin.sha256(bfh(test_htlc['preimage'])),
+                                cltv_expiry=test_htlc['expiry'],
+                                htlc_id=None,
+                                timestamp=0)
+                            # only add htlcs whose spending transaction creates above-dust ouputs
+                            # TODO: should we include this check in make_commitment?
+                            if test_htlc['amount'] // 1000 >= (threshold_sat_received if test_htlc['incoming'] else threshold_sat_offered):
+                                test_htlcs[test_index] = ScriptHtlc(htlc_script, update_add_htlc)
+
+                    our_commit_tx = make_commitment(
+                        ctn=commitment_number,
+                        local_funding_pubkey=local_funding_pubkey,
+                        remote_funding_pubkey=remote_funding_pubkey,
+                        remote_payment_pubkey=remote_payment_basepoint,  # no key rotation for anchors
+                        funder_payment_basepoint=local_payment_basepoint,
+                        fundee_payment_basepoint=remote_payment_basepoint,
+                        revocation_pubkey=local_revocation_pubkey,
+                        delayed_pubkey=local_delayedpubkey,
+                        to_self_delay=local_delay,
+                        funding_txid=funding_tx_id,
+                        funding_pos=funding_output_index,
+                        funding_sat=funding_amount_satoshi,
+                        local_amount=to_local_msat,
+                        remote_amount=to_remote_msat,
+                        dust_limit_sat=local_dust_limit_satoshi,
+                        fees_per_participant=calc_fees_for_commitment_tx(num_htlcs=len(test_htlcs), feerate=local_feerate_per_kw, is_local_initiator=True, has_anchors=True),
+                        htlcs=list(test_htlcs.values()),
+                        has_anchors=True
+                    )
+                    self.sign_and_insert_remote_sig(our_commit_tx, remote_funding_pubkey, remote_signature, local_funding_pubkey, local_funding_privkey)
+                    self.assertEqual(str(our_commit_tx), ref_commit_tx_str)  # only works without r value grinding
+
+                    # test the transactions spending the htlc outputs
+                    # we need to keep track of the htlc order in order to compare to test vectors
+                    sorted_htlcs = {h[0]: h[1] for h in sorted(test_htlcs.items(), key=lambda x: (x[1].htlc.amount_msat, -x[1].htlc.cltv_expiry))}
+                    if use_test_htlcs:
+                        for output_index, (test_index, htlc) in enumerate(sorted_htlcs.items()):
+                            test_htlc = TEST_HTLCS[test_index]
+                            our_htlc = self.htlc_tx(
+                                htlc=htlc.redeem_script,
+                                htlc_output_index=output_index + 2,  # first two are anchors
+                                amount_msat=htlc.htlc.amount_msat,
+                                htlc_payment_preimage=bfh(test_htlc['preimage']),
+                                remote_htlc_sig=htlc_descs[output_index]['RemoteSigHex'],
+                                success=test_htlc['incoming'],
+                                cltv_timeout=test_htlc['expiry'] if not test_htlc['incoming'] else 0,  # expiry is for timeout transaction
+                                local_feerate_per_kw=local_feerate_per_kw,
+                                our_commit_tx=our_commit_tx,
+                                has_anchors=True
+                            )
+                            ref_htlc = htlc_descs[output_index]['ResolutionTxHex']
+                            self.assertEqual(our_htlc, ref_htlc)  # only works without r value grinding
+        finally:
+            lnutil.effective_htlc_tx_weight = effective_htlc_tx_weight_original
 
     def sign_and_insert_remote_sig(self, tx: PartialTransaction, remote_pubkey, remote_signature, pubkey, privkey):
         assert type(remote_pubkey) is bytes
