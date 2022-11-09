@@ -15,7 +15,7 @@ from .util import bfh, bh2u, inv_dict, UserFacingException
 from .util import list_enabled_bits
 from .crypto import sha256
 from .transaction import (Transaction, PartialTransaction, PartialTxInput, TxOutpoint,
-                          PartialTxOutput, opcodes, TxOutput)
+                          PartialTxOutput, opcodes, TxOutput, OPPushDataPubkey)
 from .ecc import CURVE_ORDER, sig_string_from_der_sig, ECPubkey, string_to_number
 from . import ecc, bitcoin, crypto, transaction
 from .bitcoin import (push_script, redeem_script_to_address, address_to_script,
@@ -35,12 +35,18 @@ if TYPE_CHECKING:
 
 # defined in BOLT-03:
 HTLC_TIMEOUT_WEIGHT = 663
+HTLC_TIMEOUT_WEIGHT_ANCHORS = 666
 HTLC_SUCCESS_WEIGHT = 703
+HTLC_SUCCESS_WEIGHT_ANCHORS = 706
 COMMITMENT_TX_WEIGHT = 724
+COMMITMENT_TX_WEIGHT_ANCHORS = 1124
 HTLC_OUTPUT_WEIGHT = 172
+FIXED_ANCHOR_SAT = 330
 
 LN_MAX_FUNDING_SAT = pow(2, 24) - 1
 DUST_LIMIT_MAX = 1000
+
+SCRIPT_TEMPLATE_FUNDING = [opcodes.OP_2, OPPushDataPubkey, OPPushDataPubkey, opcodes.OP_2, opcodes.OP_CHECKMULTISIG]
 
 # dummy address for fee estimation of funding tx
 def ln_dummy_address():
@@ -133,6 +139,7 @@ class ChannelConfig(StoredObject):
             funding_sat: int,
             is_local_initiator: bool,  # whether we are the funder
             initial_feerate_per_kw: int,
+            has_anchors: bool,
     ) -> None:
         # first we validate the configs separately
         local_config.validate_params(funding_sat=funding_sat)
@@ -158,7 +165,9 @@ class ChannelConfig(StoredObject):
         if funder_config.initial_msat < calc_fees_for_commitment_tx(
                 num_htlcs=0,
                 feerate=initial_feerate_per_kw,
-                is_local_initiator=is_local_initiator)[funder]:
+                is_local_initiator=is_local_initiator,
+                has_anchors=has_anchors,
+        )[funder]:
             raise Exception(
                 "the funder's amount for the initial commitment transaction "
                 "is not sufficient for full fee payment")
@@ -187,7 +196,6 @@ class LocalConfig(ChannelConfig):
     @classmethod
     def from_seed(self, **kwargs):
         channel_seed = kwargs['channel_seed']
-        static_remotekey = kwargs.pop('static_remotekey')
         node = BIP32Node.from_rootseed(channel_seed, xtype='standard')
         keypair_generator = lambda family: generate_keypair(node, family)
         kwargs['per_commitment_secret_seed'] = keypair_generator(LnKeyFamily.REVOCATION_ROOT).privkey
@@ -195,7 +203,22 @@ class LocalConfig(ChannelConfig):
         kwargs['htlc_basepoint'] = keypair_generator(LnKeyFamily.HTLC_BASE)
         kwargs['delayed_basepoint'] = keypair_generator(LnKeyFamily.DELAY_BASE)
         kwargs['revocation_basepoint'] = keypair_generator(LnKeyFamily.REVOCATION_BASE)
-        kwargs['payment_basepoint'] = OnlyPubkeyKeypair(static_remotekey) if static_remotekey else keypair_generator(LnKeyFamily.PAYMENT_BASE)
+        static_remotekey = kwargs.pop('static_remotekey')
+        static_payment_key = kwargs.pop('static_payment_key')
+        if static_payment_key:
+            # We derive the payment_basepoint from a static secret (derived from
+            # the wallet seed) and a public nonce that is revealed
+            # when the funding transaction is spent. This way we can restore the
+            # payment_basepoint, needed for sweeping in the event of a force close.
+            kwargs['payment_basepoint'] = derive_payment_basepoint(
+                static_payment_secret=static_payment_key.privkey,
+                funding_pubkey=kwargs['multisig_key'].pubkey
+            )
+        elif static_remotekey:  # we automatically sweep to a wallet address
+            kwargs['payment_basepoint'] = OnlyPubkeyKeypair(static_remotekey)
+        else:  # legacy channel with key rotation
+            kwargs['payment_basepoint'] = keypair_generator(LnKeyFamily.PAYMENT_BASE)
+
         return LocalConfig(**kwargs)
 
     def validate_params(self, *, funding_sat: int) -> None:
@@ -516,7 +539,25 @@ def derive_blinded_privkey(basepoint_secret: bytes, per_commitment_secret: bytes
     return int.to_bytes(sum, length=32, byteorder='big', signed=False)
 
 
-def make_htlc_tx_output(amount_msat, local_feerate, revocationpubkey, local_delayedpubkey, success, to_self_delay):
+def derive_payment_basepoint(static_payment_secret: bytes, funding_pubkey: bytes) -> Keypair:
+    assert isinstance(static_payment_secret, bytes)
+    assert isinstance(funding_pubkey, bytes)
+    payment_basepoint = ecc.ECPrivkey(sha256(static_payment_secret + funding_pubkey))
+    return Keypair(
+        pubkey=payment_basepoint.get_public_key_bytes(),
+        privkey=payment_basepoint.get_secret_bytes()
+    )
+
+
+def make_htlc_tx_output(
+    amount_msat,
+    local_feerate,
+    revocationpubkey,
+    local_delayedpubkey,
+    success,
+    to_self_delay,
+    has_anchors: bool
+):
     assert type(amount_msat) is int
     assert type(local_feerate) is int
     script = make_commitment_output_to_local_witness_script(
@@ -526,7 +567,7 @@ def make_htlc_tx_output(amount_msat, local_feerate, revocationpubkey, local_dela
     )
 
     p2wsh = bitcoin.redeem_script_to_address('p2wsh', bh2u(script))
-    weight = HTLC_SUCCESS_WEIGHT if success else HTLC_TIMEOUT_WEIGHT
+    weight = effective_htlc_tx_weight(success=success, has_anchors=has_anchors)
     fee = local_feerate * weight
     fee = fee // 1000 * 1000
     final_amount_sat = (amount_msat - fee) // 1000
@@ -562,13 +603,18 @@ def make_htlc_tx(*, cltv_expiry: int, inputs: List[PartialTxInput], output: Part
     tx = PartialTransaction.from_io(inputs, c_outputs, locktime=cltv_expiry, version=2)
     return tx
 
-def make_offered_htlc(revocation_pubkey: bytes, remote_htlcpubkey: bytes,
-                      local_htlcpubkey: bytes, payment_hash: bytes) -> bytes:
+def make_offered_htlc(
+    revocation_pubkey: bytes,
+    remote_htlcpubkey: bytes,
+    local_htlcpubkey: bytes,
+    payment_hash: bytes,
+    has_anchors: bool,
+) -> bytes:
     assert type(revocation_pubkey) is bytes
     assert type(remote_htlcpubkey) is bytes
     assert type(local_htlcpubkey) is bytes
     assert type(payment_hash) is bytes
-    script = bfh(construct_script([
+    script_opcodes = [
         opcodes.OP_DUP,
         opcodes.OP_HASH160,
         bitcoin.hash_160(revocation_pubkey),
@@ -594,17 +640,26 @@ def make_offered_htlc(revocation_pubkey: bytes, remote_htlcpubkey: bytes,
         opcodes.OP_EQUALVERIFY,
         opcodes.OP_CHECKSIG,
         opcodes.OP_ENDIF,
-        opcodes.OP_ENDIF,
-    ]))
+    ]
+    if has_anchors:
+        script_opcodes.extend([1, opcodes.OP_CHECKSEQUENCEVERIFY, opcodes.OP_DROP])
+    script_opcodes.append(opcodes.OP_ENDIF)
+    script = bfh(construct_script(script_opcodes))
     return script
 
-def make_received_htlc(revocation_pubkey: bytes, remote_htlcpubkey: bytes,
-                       local_htlcpubkey: bytes, payment_hash: bytes, cltv_expiry: int) -> bytes:
+def make_received_htlc(
+    revocation_pubkey: bytes,
+    remote_htlcpubkey: bytes,
+    local_htlcpubkey: bytes,
+    payment_hash: bytes,
+    cltv_expiry: int,
+    has_anchors: bool,
+) -> bytes:
     for i in [revocation_pubkey, remote_htlcpubkey, local_htlcpubkey, payment_hash]:
         assert type(i) is bytes
     assert type(cltv_expiry) is int
 
-    script = bfh(construct_script([
+    script_opcodes = [
         opcodes.OP_DUP,
         opcodes.OP_HASH160,
         bitcoin.hash_160(revocation_pubkey),
@@ -633,8 +688,11 @@ def make_received_htlc(revocation_pubkey: bytes, remote_htlcpubkey: bytes,
         opcodes.OP_DROP,
         opcodes.OP_CHECKSIG,
         opcodes.OP_ENDIF,
-        opcodes.OP_ENDIF,
-    ]))
+    ]
+    if has_anchors:
+        script_opcodes.extend([1, opcodes.OP_CHECKSEQUENCEVERIFY, opcodes.OP_DROP])
+    script_opcodes.append(opcodes.OP_ENDIF)
+    script = bfh(construct_script(script_opcodes))
     return script
 
 WITNESS_TEMPLATE_OFFERED_HTLC = [
@@ -699,19 +757,32 @@ WITNESS_TEMPLATE_RECEIVED_HTLC = [
 ]
 
 
-def make_htlc_output_witness_script(is_received_htlc: bool, remote_revocation_pubkey: bytes, remote_htlc_pubkey: bytes,
-                                    local_htlc_pubkey: bytes, payment_hash: bytes, cltv_expiry: Optional[int]) -> bytes:
+def make_htlc_output_witness_script(
+    is_received_htlc: bool,
+    remote_revocation_pubkey: bytes,
+    remote_htlc_pubkey: bytes,
+    local_htlc_pubkey: bytes,
+    payment_hash: bytes,
+    cltv_expiry: Optional[int],
+    has_anchors: bool,
+) -> bytes:
     if is_received_htlc:
-        return make_received_htlc(revocation_pubkey=remote_revocation_pubkey,
-                                  remote_htlcpubkey=remote_htlc_pubkey,
-                                  local_htlcpubkey=local_htlc_pubkey,
-                                  payment_hash=payment_hash,
-                                  cltv_expiry=cltv_expiry)
+        return make_received_htlc(
+            revocation_pubkey=remote_revocation_pubkey,
+            remote_htlcpubkey=remote_htlc_pubkey,
+            local_htlcpubkey=local_htlc_pubkey,
+            payment_hash=payment_hash,
+            cltv_expiry=cltv_expiry,
+            has_anchors=has_anchors,
+        )
     else:
-        return make_offered_htlc(revocation_pubkey=remote_revocation_pubkey,
-                                 remote_htlcpubkey=remote_htlc_pubkey,
-                                 local_htlcpubkey=local_htlc_pubkey,
-                                 payment_hash=payment_hash)
+        return make_offered_htlc(
+            revocation_pubkey=remote_revocation_pubkey,
+            remote_htlcpubkey=remote_htlc_pubkey,
+            local_htlcpubkey=local_htlc_pubkey,
+            payment_hash=payment_hash,
+            has_anchors=has_anchors,
+        )
 
 
 def get_ordered_channel_configs(chan: 'AbstractChannel', for_us: bool) -> Tuple[Union[LocalConfig, RemoteConfig],
@@ -731,12 +802,15 @@ def possible_output_idxs_of_htlc_in_ctx(*, chan: 'Channel', pcp: bytes, subject:
     other_revocation_pubkey = derive_blinded_pubkey(other_conf.revocation_basepoint.pubkey, pcp)
     other_htlc_pubkey = derive_pubkey(other_conf.htlc_basepoint.pubkey, pcp)
     htlc_pubkey = derive_pubkey(conf.htlc_basepoint.pubkey, pcp)
-    preimage_script = make_htlc_output_witness_script(is_received_htlc=htlc_direction == RECEIVED,
-                                                      remote_revocation_pubkey=other_revocation_pubkey,
-                                                      remote_htlc_pubkey=other_htlc_pubkey,
-                                                      local_htlc_pubkey=htlc_pubkey,
-                                                      payment_hash=payment_hash,
-                                                      cltv_expiry=cltv_expiry)
+    preimage_script = make_htlc_output_witness_script(
+        is_received_htlc=htlc_direction == RECEIVED,
+        remote_revocation_pubkey=other_revocation_pubkey,
+        remote_htlc_pubkey=other_htlc_pubkey,
+        local_htlc_pubkey=htlc_pubkey,
+        payment_hash=payment_hash,
+        cltv_expiry=cltv_expiry,
+        has_anchors=chan.has_anchors(),
+    )
     htlc_address = redeem_script_to_address('p2wsh', bh2u(preimage_script))
     candidates = ctx.get_output_idxs_from_address(htlc_address)
     return {output_idx for output_idx in candidates
@@ -788,22 +862,29 @@ def make_htlc_tx_with_open_channel(*, chan: 'Channel', pcp: bytes, subject: 'HTL
     # if we do not receive, and the commitment tx is not for us, they receive, so it is also an HTLC-success
     is_htlc_success = htlc_direction == RECEIVED
     witness_script_of_htlc_tx_output, htlc_tx_output = make_htlc_tx_output(
-        amount_msat = amount_msat,
-        local_feerate = chan.get_feerate(subject, ctn=ctn),
+        amount_msat=amount_msat,
+        local_feerate=chan.get_feerate(subject, ctn=ctn),
         revocationpubkey=other_revocation_pubkey,
         local_delayedpubkey=delayedpubkey,
-        success = is_htlc_success,
-        to_self_delay = other_conf.to_self_delay)
-    preimage_script = make_htlc_output_witness_script(is_received_htlc=is_htlc_success,
-                                                      remote_revocation_pubkey=other_revocation_pubkey,
-                                                      remote_htlc_pubkey=other_htlc_pubkey,
-                                                      local_htlc_pubkey=htlc_pubkey,
-                                                      payment_hash=payment_hash,
-                                                      cltv_expiry=cltv_expiry)
+        success=is_htlc_success,
+        to_self_delay=other_conf.to_self_delay,
+        has_anchors=chan.has_anchors(),
+    )
+    preimage_script = make_htlc_output_witness_script(
+        is_received_htlc=is_htlc_success,
+        remote_revocation_pubkey=other_revocation_pubkey,
+        remote_htlc_pubkey=other_htlc_pubkey,
+        local_htlc_pubkey=htlc_pubkey,
+        payment_hash=payment_hash,
+        cltv_expiry=cltv_expiry,
+        has_anchors=chan.has_anchors(),
+    )
     htlc_tx_inputs = make_htlc_tx_inputs(
         commit.txid(), ctx_output_idx,
         amount_msat=amount_msat,
         witness_script=bh2u(preimage_script))
+    if chan.has_anchors():
+        htlc_tx_inputs[0].nsequence = 1
     if is_htlc_success:
         cltv_expiry = 0
     htlc_tx = make_htlc_tx(cltv_expiry=cltv_expiry, inputs=htlc_tx_inputs, output=htlc_tx_output)
@@ -843,41 +924,90 @@ RECEIVED = Direction.RECEIVED
 LOCAL = HTLCOwner.LOCAL
 REMOTE = HTLCOwner.REMOTE
 
-def make_commitment_outputs(*, fees_per_participant: Mapping[HTLCOwner, int], local_amount_msat: int, remote_amount_msat: int,
-        local_script: str, remote_script: str, htlcs: List[ScriptHtlc], dust_limit_sat: int) -> Tuple[List[PartialTxOutput], List[PartialTxOutput]]:
-    # BOLT-03: "Base commitment transaction fees are extracted from the funder's amount;
-    #           if that amount is insufficient, the entire amount of the funder's output is used."
-    #   -> if funder cannot afford feerate, their output might go negative, so take max(0, x) here:
-    to_local_amt = max(0, local_amount_msat - fees_per_participant[LOCAL])
-    to_local = PartialTxOutput(scriptpubkey=bfh(local_script), value=to_local_amt // 1000)
-    to_remote_amt = max(0, remote_amount_msat - fees_per_participant[REMOTE])
-    to_remote = PartialTxOutput(scriptpubkey=bfh(remote_script), value=to_remote_amt // 1000)
 
-    non_htlc_outputs = [to_local, to_remote]
+def make_commitment_outputs(
+    *,
+    fees_per_participant: Mapping[HTLCOwner, int],
+    local_amount_msat: int,
+    remote_amount_msat: int,
+    local_script: str,
+    remote_script: str,
+    htlcs: List[ScriptHtlc],
+    dust_limit_sat: int,
+    has_anchors: bool,
+    local_anchor_script: Optional[str],
+    remote_anchor_script: Optional[str]
+) -> Tuple[List[PartialTxOutput], List[PartialTxOutput]]:
+
+    # determine HTLC outputs and trim below dust to know if anchors need to be included
     htlc_outputs = []
     for script, htlc in htlcs:
         addr = bitcoin.redeem_script_to_address('p2wsh', bh2u(script))
-        htlc_outputs.append(PartialTxOutput(scriptpubkey=bfh(address_to_script(addr)),
-                                            value=htlc.amount_msat // 1000))
+        if htlc.amount_msat // 1000 > dust_limit_sat:
+            htlc_outputs.append(
+                PartialTxOutput(
+                    scriptpubkey=bfh(address_to_script(addr)),
+                    value=htlc.amount_msat // 1000
+                ))
 
-    # trim outputs
+    # BOLT-03: "Base commitment transaction fees are extracted from the funder's amount;
+    #           if that amount is insufficient, the entire amount of the funder's output is used."
+    non_htlc_outputs = []
+    to_local_amt_msat = local_amount_msat - fees_per_participant[LOCAL]
+    to_remote_amt_msat = remote_amount_msat - fees_per_participant[REMOTE]
+
+    anchor_outputs = []
+    # if no anchor scripts are set, we ignore anchor outputs, useful when this
+    # function is used to determine outputs for a collaborative close
+    if has_anchors and local_anchor_script and remote_anchor_script:
+        local_pays_anchors = bool(fees_per_participant[LOCAL])
+        # we always allocate for two anchor outputs even if they are not added
+        if local_pays_anchors:
+            to_local_amt_msat -= 2 * FIXED_ANCHOR_SAT * 1000
+        else:
+            to_remote_amt_msat -= 2 * FIXED_ANCHOR_SAT * 1000
+
+        # include anchors for outputs that materialize, include both if there are HTLCs present
+        if to_local_amt_msat // 1000 >= dust_limit_sat or htlc_outputs:
+            anchor_outputs.append(PartialTxOutput(scriptpubkey=bfh(local_anchor_script), value=FIXED_ANCHOR_SAT))
+        if to_remote_amt_msat // 1000 >= dust_limit_sat or htlc_outputs:
+            anchor_outputs.append(PartialTxOutput(scriptpubkey=bfh(remote_anchor_script), value=FIXED_ANCHOR_SAT))
+
+    # if funder cannot afford feerate, their output might go negative, so take max(0, x) here
+    to_local_amt_msat = max(0, to_local_amt_msat)
+    to_remote_amt_msat = max(0, to_remote_amt_msat)
+    non_htlc_outputs.append(PartialTxOutput(scriptpubkey=bfh(local_script), value=to_local_amt_msat // 1000))
+    non_htlc_outputs.append(PartialTxOutput(scriptpubkey=bfh(remote_script), value=to_remote_amt_msat // 1000))
+
     c_outputs_filtered = list(filter(lambda x: x.value >= dust_limit_sat, non_htlc_outputs + htlc_outputs))
-    return htlc_outputs, c_outputs_filtered
+    c_outputs = c_outputs_filtered + anchor_outputs
+    return htlc_outputs, c_outputs
 
 
-def offered_htlc_trim_threshold_sat(*, dust_limit_sat: int, feerate: int) -> int:
+def effective_htlc_tx_weight(success: bool, has_anchors: bool):
+    # for anchors-zero-fee-htlc we set an effective weight of zero
+    # we only trim htlcs below dust, as in the anchors commitment format,
+    # the fees for the hltc transaction don't need to be subtracted from
+    # the htlc output, but fees are taken from extra attached inputs
+    if has_anchors:
+        return 0 * HTLC_SUCCESS_WEIGHT_ANCHORS if success else 0 * HTLC_TIMEOUT_WEIGHT_ANCHORS
+    else:
+        return HTLC_SUCCESS_WEIGHT if success else HTLC_TIMEOUT_WEIGHT
+
+
+def offered_htlc_trim_threshold_sat(*, dust_limit_sat: int, feerate: int, has_anchors: bool) -> int:
     # offered htlcs strictly below this amount will be trimmed (from ctx).
     # feerate is in sat/kw
     # returns value in sat
-    weight = HTLC_TIMEOUT_WEIGHT
+    weight = effective_htlc_tx_weight(success=False, has_anchors=has_anchors)
     return dust_limit_sat + weight * feerate // 1000
 
 
-def received_htlc_trim_threshold_sat(*, dust_limit_sat: int, feerate: int) -> int:
+def received_htlc_trim_threshold_sat(*, dust_limit_sat: int, feerate: int, has_anchors: bool) -> int:
     # received htlcs strictly below this amount will be trimmed (from ctx).
     # feerate is in sat/kw
     # returns value in sat
-    weight = HTLC_SUCCESS_WEIGHT
+    weight = effective_htlc_tx_weight(success=True, has_anchors=has_anchors)
     return dust_limit_sat + weight * feerate // 1000
 
 
@@ -888,13 +1018,17 @@ def fee_for_htlc_output(*, feerate: int) -> int:
 
 
 def calc_fees_for_commitment_tx(*, num_htlcs: int, feerate: int,
-                                is_local_initiator: bool, round_to_sat: bool = True) -> Dict['HTLCOwner', int]:
+                                is_local_initiator: bool, round_to_sat: bool = True, has_anchors: bool) -> Dict['HTLCOwner', int]:
     # feerate is in sat/kw
     # returns fees in msats
     # note: BOLT-02 specifies that msat fees need to be rounded down to sat.
     #       However, the rounding needs to happen for the total fees, so if the return value
     #       is to be used as part of additional fee calculation then rounding should be done after that.
-    overall_weight = COMMITMENT_TX_WEIGHT + num_htlcs * HTLC_OUTPUT_WEIGHT
+    if has_anchors:
+        commitment_tx_weight = COMMITMENT_TX_WEIGHT_ANCHORS
+    else:
+        commitment_tx_weight = COMMITMENT_TX_WEIGHT
+    overall_weight = commitment_tx_weight + num_htlcs * HTLC_OUTPUT_WEIGHT
     fee = feerate * overall_weight
     if round_to_sat:
         fee = fee // 1000 * 1000
@@ -922,7 +1056,8 @@ def make_commitment(
         remote_amount: int,
         dust_limit_sat: int,
         fees_per_participant: Mapping[HTLCOwner, int],
-        htlcs: List[ScriptHtlc]
+        htlcs: List[ScriptHtlc],
+        has_anchors: bool
 ) -> PartialTransaction:
     c_input = make_funding_input(local_funding_pubkey, remote_funding_pubkey,
                                  funding_pos, funding_txid, funding_sat)
@@ -935,7 +1070,12 @@ def make_commitment(
 
     # commitment tx outputs
     local_address = make_commitment_output_to_local_address(revocation_pubkey, to_self_delay, delayed_pubkey)
-    remote_address = make_commitment_output_to_remote_address(remote_payment_pubkey)
+    remote_address = make_commitment_output_to_remote_address(remote_payment_pubkey, has_anchors)
+    local_anchor_address = None
+    remote_anchor_address = None
+    if has_anchors:
+        local_anchor_address = make_commitment_output_to_anchor_address(local_funding_pubkey)
+        remote_anchor_address = make_commitment_output_to_anchor_address(remote_funding_pubkey)
     # note: it is assumed that the given 'htlcs' are all non-dust (dust htlcs already trimmed)
 
     # BOLT-03: "Transaction Input and Output Ordering
@@ -952,7 +1092,11 @@ def make_commitment(
         local_script=address_to_script(local_address),
         remote_script=address_to_script(remote_address),
         htlcs=htlcs,
-        dust_limit_sat=dust_limit_sat)
+        dust_limit_sat=dust_limit_sat,
+        has_anchors=has_anchors,
+        local_anchor_script=address_to_script(local_anchor_address) if local_anchor_address else None,
+        remote_anchor_script=address_to_script(remote_anchor_address) if remote_anchor_address else None
+    )
 
     assert sum(x.value for x in c_outputs_filtered) <= funding_sat, (c_outputs_filtered, funding_sat)
 
@@ -984,8 +1128,39 @@ def make_commitment_output_to_local_address(
     local_script = make_commitment_output_to_local_witness_script(revocation_pubkey, to_self_delay, delayed_pubkey)
     return bitcoin.redeem_script_to_address('p2wsh', bh2u(local_script))
 
-def make_commitment_output_to_remote_address(remote_payment_pubkey: bytes) -> str:
-    return bitcoin.pubkey_to_address('p2wpkh', bh2u(remote_payment_pubkey))
+def make_commitment_output_to_remote_witness_script(remote_payment_pubkey: bytes) -> bytes:
+    assert isinstance(remote_payment_pubkey, bytes)
+    script = bfh(construct_script([
+        remote_payment_pubkey,
+        opcodes.OP_CHECKSIGVERIFY,
+        opcodes.OP_1,
+        opcodes.OP_CHECKSEQUENCEVERIFY,
+    ]))
+    return script
+
+def make_commitment_output_to_remote_address(remote_payment_pubkey: bytes, has_anchors: bool) -> str:
+    if has_anchors:
+        remote_script = make_commitment_output_to_remote_witness_script(remote_payment_pubkey)
+        return bitcoin.redeem_script_to_address('p2wsh', bh2u(remote_script))
+    else:
+        return bitcoin.pubkey_to_address('p2wpkh', bh2u(remote_payment_pubkey))
+
+def make_commitment_output_to_anchor_witness_script(funding_pubkey: bytes) -> bytes:
+    assert isinstance(funding_pubkey, bytes)
+    script = bfh(construct_script([
+        funding_pubkey,
+        opcodes.OP_CHECKSIG,
+        opcodes.OP_IFDUP,
+        opcodes.OP_NOTIF,
+        opcodes.OP_16,
+        opcodes.OP_CHECKSEQUENCEVERIFY,
+        opcodes.OP_ENDIF,
+    ]))
+    return script
+
+def make_commitment_output_to_anchor_address(funding_pubkey: bytes) -> str:
+    script = make_commitment_output_to_anchor_witness_script(funding_pubkey)
+    return bitcoin.redeem_script_to_address('p2wsh', bh2u(script))
 
 def sign_and_get_sig_string(tx: PartialTransaction, local_config, remote_config):
     tx.sign({bh2u(local_config.multisig_key.pubkey): (local_config.multisig_key.privkey, True)})
@@ -1019,6 +1194,15 @@ def extract_ctn_from_tx_and_chan(tx: Transaction, chan: 'AbstractChannel') -> in
     return extract_ctn_from_tx(tx, txin_index=0,
                                funder_payment_basepoint=funder_conf.payment_basepoint.pubkey,
                                fundee_payment_basepoint=fundee_conf.payment_basepoint.pubkey)
+
+
+def ctx_has_anchors(tx: Transaction):
+    output_values = [output.value for output in tx.outputs()]
+    if FIXED_ANCHOR_SAT in output_values:
+        return True
+    else:
+        return False
+
 
 def get_ecdh(priv: bytes, pub: bytes) -> bytes:
     pt = ECPubkey(pub) * string_to_number(priv)
@@ -1089,6 +1273,18 @@ class LnFeatures(IntFlag):
     OPTION_SUPPORT_LARGE_CHANNEL_OPT = 1 << 19
     _ln_feature_contexts[OPTION_SUPPORT_LARGE_CHANNEL_OPT] = (LNFC.INIT | LNFC.NODE_ANN)
     _ln_feature_contexts[OPTION_SUPPORT_LARGE_CHANNEL_REQ] = (LNFC.INIT | LNFC.NODE_ANN)
+
+    OPTION_ANCHOR_OUTPUTS_REQ = 1 << 20
+    OPTION_ANCHOR_OUTPUTS_OPT = 1 << 21
+    _ln_feature_direct_dependencies[OPTION_ANCHOR_OUTPUTS_OPT] = {OPTION_STATIC_REMOTEKEY_OPT}
+    _ln_feature_contexts[OPTION_ANCHOR_OUTPUTS_REQ] = (LNFC.INIT | LNFC.NODE_ANN)
+    _ln_feature_contexts[OPTION_ANCHOR_OUTPUTS_OPT] = (LNFC.INIT | LNFC.NODE_ANN)
+
+    OPTION_ANCHORS_ZERO_FEE_HTLC_REQ = 1 << 22
+    OPTION_ANCHORS_ZERO_FEE_HTLC_OPT = 1 << 23
+    _ln_feature_direct_dependencies[OPTION_ANCHORS_ZERO_FEE_HTLC_OPT] = {OPTION_STATIC_REMOTEKEY_OPT}
+    _ln_feature_contexts[OPTION_ANCHORS_ZERO_FEE_HTLC_REQ] = (LNFC.INIT | LNFC.NODE_ANN)
+    _ln_feature_contexts[OPTION_ANCHORS_ZERO_FEE_HTLC_OPT] = (LNFC.INIT | LNFC.NODE_ANN)
 
     # This is still a temporary number. Also used by Eclair.
     OPTION_TRAMPOLINE_ROUTING_REQ = 1 << 148
@@ -1252,6 +1448,7 @@ LN_FEATURES_IMPLEMENTED = (
         | LnFeatures.OPTION_TRAMPOLINE_ROUTING_OPT | LnFeatures.OPTION_TRAMPOLINE_ROUTING_REQ
         | LnFeatures.OPTION_SHUTDOWN_ANYSEGWIT_OPT | LnFeatures.OPTION_SHUTDOWN_ANYSEGWIT_REQ
         | LnFeatures.OPTION_CHANNEL_TYPE_OPT | LnFeatures.OPTION_CHANNEL_TYPE_REQ
+        | LnFeatures.OPTION_ANCHORS_ZERO_FEE_HTLC_OPT | LnFeatures.OPTION_ANCHORS_ZERO_FEE_HTLC_REQ
 )
 
 

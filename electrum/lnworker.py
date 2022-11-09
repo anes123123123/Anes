@@ -209,6 +209,7 @@ class LNWorker(Logger, EventListener, NetworkRetryManager[LNPeerAddr]):
         self.lock = threading.RLock()
         self.node_keypair = generate_keypair(BIP32Node.from_xkey(xprv), LnKeyFamily.NODE_KEY)
         self.backup_key = generate_keypair(BIP32Node.from_xkey(xprv), LnKeyFamily.BACKUP_CIPHER).privkey
+        self.static_payment_key = generate_keypair(BIP32Node.from_xkey(xprv), LnKeyFamily.PAYMENT_BASE)
         self._peers = {}  # type: Dict[bytes, Peer]  # pubkey -> Peer  # needs self.lock
         self.taskgroup = OldTaskGroup()
         self.listen_server = None  # type: Optional[asyncio.AbstractServer]
@@ -626,7 +627,10 @@ class LNWallet(LNWorker):
         self.wallet = wallet
         self.db = wallet.db
         Logger.__init__(self)
-        LNWorker.__init__(self, xprv, LNWALLET_FEATURES)
+        features = LNWALLET_FEATURES
+        if wallet.config.get('enable_anchor_channels'):
+            features |= LnFeatures.OPTION_ANCHOR_ZERO_FEE_HTLC_OPT
+        LNWorker.__init__(self, xprv, features)
         self.config = wallet.config
         self.lnwatcher = None
         self.lnrater: LNRater = None
@@ -636,6 +640,7 @@ class LNWallet(LNWorker):
         self.logs = defaultdict(list)  # type: Dict[str, List[HtlcLog]]  # key is RHASH  # (not persisted)
         # used in tests
         self.enable_htlc_settle = True
+        self.enable_htlc_settle_onchain = True
         self.enable_htlc_forwarding = True
 
         # note: accessing channels (besides simple lookup) needs self.lock!
