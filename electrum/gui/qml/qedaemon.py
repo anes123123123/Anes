@@ -263,8 +263,8 @@ class QEDaemon(AuthMixin, QObject):
 
         self.delete_wallet(wallet)
 
-    @auth_protect(message=_('Really delete this wallet?'))
-    def delete_wallet(self, wallet):
+    @auth_protect(method='wallet_password', message=_('Really delete this wallet?'))
+    def delete_wallet(self, wallet, password=None):
         path = standardize_path(wallet.wallet.storage.path)
         self._logger.debug('deleting wallet with path %s' % path)
         self._current_wallet = None
@@ -314,12 +314,15 @@ class QEDaemon(AuthMixin, QObject):
         return f'wallet_{i}'
 
     @pyqtSlot()
-    @auth_protect(method='wallet')
     def startChangePassword(self):
         if self._use_single_password:
-            self.requestNewPassword.emit()
+            self._do_start_change_all_passwords()
         else:
-            self.currentWallet.requestNewPassword.emit()
+            self.currentWallet.startChangePassword()
+
+    @auth_protect(method='wallet_password')
+    def _do_start_change_all_passwords(self, password=None):
+        self.requestNewPassword.emit()
 
     @pyqtSlot(str, result=bool)
     def setPassword(self, password):

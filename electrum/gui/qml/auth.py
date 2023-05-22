@@ -1,8 +1,9 @@
 from functools import wraps, partial
 
-from PyQt5.QtCore import pyqtSignal, pyqtSlot, pyqtProperty
+from PyQt5.QtCore import pyqtSignal, pyqtSlot
 
 from electrum.logging import get_logger
+
 
 def auth_protect(func=None, reject=None, method='pin', message=''):
     if func is None:
@@ -20,23 +21,28 @@ def auth_protect(func=None, reject=None, method='pin', message=''):
 
     return wrapper
 
+
 class AuthMixin:
     _auth_logger = get_logger(__name__)
     authRequired = pyqtSignal([str, str], arguments=['method', 'authMessage'])
 
     @pyqtSlot()
-    def authProceed(self):
+    @pyqtSlot(str)
+    def authProceed(self, password=None):
         self._auth_logger.debug('Proceeding with authed fn()')
         try:
             self._auth_logger.debug(str(getattr(self, '__auth_fcall')))
-            (func,args,kwargs,reject) = getattr(self, '__auth_fcall')
-            r = func(self, *args, **kwargs)
+            (func, args, kwargs, reject) = getattr(self, '__auth_fcall')
+            if password and 'password' in func.__code__.co_varnames:
+                r = func(self, *args, **dict(kwargs, password=password))
+            else:
+                r = func(self, *args, **kwargs)
             return r
         except Exception as e:
             self._auth_logger.error(f'Error executing wrapped fn(): {repr(e)}')
             raise e
         finally:
-            delattr(self,'__auth_fcall')
+            delattr(self, '__auth_fcall')
 
     @pyqtSlot()
     def authCancel(self):
@@ -45,7 +51,7 @@ class AuthMixin:
             return
 
         try:
-            (func,args,kwargs,reject) = getattr(self, '__auth_fcall')
+            (func, args, kwargs, reject) = getattr(self, '__auth_fcall')
             if reject is not None:
                 if hasattr(self, reject):
                     getattr(self, reject)()
