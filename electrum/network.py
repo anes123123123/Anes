@@ -519,8 +519,9 @@ class Network(Logger, NetworkRetryManager[ServerAddr]):
         self.auto_connect = self.config.NETWORK_AUTO_CONNECT
         if self.auto_connect and self.config.NETWORK_ONESERVER:
             # enabling both oneserver and auto_connect doesn't really make sense
-            # assume oneserver is enabled for privacy reasons, disable auto_connect
-            self.logger.warning(f'both "oneserver" and "auto_connect" options enabled, disabling "auto_connect".')
+            # assume oneserver is enabled for privacy reasons, disable auto_connect and assume server is unpredictable
+            self.logger.warning(f'both "oneserver" and "auto_connect" options enabled, disabling "auto_connect" and resetting "server".')
+            self.config.NETWORK_SERVER = ""  # let _set_default_server set harmless default (localhost)
             self.auto_connect = False
 
         self._set_default_server()
@@ -695,14 +696,8 @@ class Network(Logger, NetworkRetryManager[ServerAddr]):
                 int(proxy['port'])
         except Exception:
             return
-        auto_connect = net_params.auto_connect
-        if auto_connect and net_params.oneserver:
-            # enabling both oneserver and auto_connect doesn't really make sense
-            # assume oneserver is enabled for privacy reasons, disable auto_connect
-            self.logger.warning(f'both "oneserver" and "auto_connect" options enabled, disabling "auto_connect".')
-            auto_connect = False
 
-        self.config.NETWORK_AUTO_CONNECT = auto_connect
+        self.config.NETWORK_AUTO_CONNECT = net_params.auto_connect
         self.config.NETWORK_ONESERVER = net_params.oneserver
         self.config.NETWORK_PROXY = proxy_str
         self.config.NETWORK_PROXY_USER = proxy_user
